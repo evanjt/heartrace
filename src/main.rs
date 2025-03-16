@@ -1,16 +1,38 @@
 use anyhow::Result;
+use btleplug::api::{Central, Manager as _, Peripheral as _};
+use btleplug::platform::Manager;
 use chrono::Local;
 use crossterm::{
     execute,
     terminal::{Clear, ClearType},
 };
-use serde::Serialize;
-use std::io::{Write, stdout};
+use futures::stream::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::io::stdout;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time;
 
-/// Shared state for our application (HR, power, cadence, etc.)
+// =====================
+// CONFIGURATION
+// =====================
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    heart_rate_device: Option<String>,
+    trainer_device: Option<String>,
+}
+
+fn load_config() -> Result<Config> {
+    let contents = std::fs::read_to_string("config.toml")?;
+    let config: Config = toml::from_str(&contents)?;
+    Ok(config)
+}
+
+// =====================
+// SHARED STATE & CSV LOGGING
+// =====================
+
 #[derive(Debug)]
 struct SharedState {
     current_hr: u32,
@@ -27,14 +49,13 @@ impl SharedState {
             current_hr: 0,
             current_power: 0,
             cadence: 0,
-            target_hr: 140, // default target HR (can be adjusted by the user)
+            target_hr: 140, // Default target HR; can be changed via UI or config later.
             target_power: 0,
             start_time: Instant::now(),
         }
     }
 }
 
-/// Record for CSV logging
 #[derive(Serialize)]
 struct LogRecord {
     timestamp: String,
@@ -45,123 +66,161 @@ struct LogRecord {
     target_hr: u32,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize shared state in a thread-safe container
-    let shared_state = Arc::new(Mutex::new(SharedState::new()));
+// =====================
+// BLE DEVICE CONNECTION & NOTIFICATIONS
+// =====================
 
-    // Spawn BLE simulation tasks (replace these with actual btleplug logic)
-    let hr_state = shared_state.clone();
-    tokio::spawn(async move {
-        simulate_hr_monitor(hr_state).await;
-    });
+/// Scans for BLE devices and returns the HR device and Trainer device found based on config.
+async fn connect_devices(
+    config: &Config,
+) -> Result<(
+    btleplug::platform::Peripheral,
+    btleplug::platform::Peripheral,
+)> {
+    let manager = Manager::new().await?;
+    let adapters = manager.adapters().await?;
+    let adapter = adapters
+        .into_iter()
+        .next()
+        .ok_or(anyhow::anyhow!("No BLE adapters found"))?;
+    adapter.start_scan(Default::default()).await?;
+    println!("Scanning for devices for 10 seconds...");
+    time::sleep(Duration::from_secs(10)).await;
 
-    let trainer_state = shared_state.clone();
-    tokio::spawn(async move {
-        simulate_trainer_data(trainer_state).await;
-    });
+    let peripherals = adapter.peripherals().await?;
+    let mut hr_device: Option<btleplug::platform::Peripheral> = None;
+    let mut trainer_device: Option<btleplug::platform::Peripheral> = None;
 
-    // Spawn the control loop that adjusts target power based on HR error
-    let control_state = shared_state.clone();
-    tokio::spawn(async move {
-        control_loop(control_state).await;
-    });
-
-    // Spawn CSV logging task (logs workout data every second)
-    let log_state = shared_state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = csv_logging_task(log_state).await {
-            eprintln!("CSV logging error: {:?}", e);
+    for peripheral in peripherals {
+        if let Some(properties) = peripheral.properties().await? {
+            if let Some(name) = properties.local_name {
+                if let Some(ref hr_filter) = config.heart_rate_device {
+                    if name.to_lowercase().contains(&hr_filter.to_lowercase()) {
+                        println!("Found HR device: {}", name);
+                        hr_device = Some(peripheral.clone());
+                    }
+                }
+                if let Some(ref trainer_filter) = config.trainer_device {
+                    if name.to_lowercase().contains(&trainer_filter.to_lowercase()) {
+                        println!("Found Trainer device: {}", name);
+                        trainer_device = Some(peripheral.clone());
+                    }
+                }
+            }
         }
-    });
+    }
+    let hr_device = hr_device.ok_or(anyhow::anyhow!("Heart rate device not found"))?;
+    let trainer_device = trainer_device.ok_or(anyhow::anyhow!("Trainer device not found"))?;
 
-    // Run the terminal UI on the main task
-    terminal_ui(shared_state).await;
+    if !hr_device.is_connected().await? {
+        hr_device.connect().await?;
+    }
+    if !trainer_device.is_connected().await? {
+        trainer_device.connect().await?;
+    }
 
+    // Discover services for both devices.
+    hr_device.discover_services().await?;
+    trainer_device.discover_services().await?;
+
+    Ok((hr_device, trainer_device))
+}
+
+/// Subscribe to Heart Rate notifications (characteristic UUID 0x2A37).
+async fn run_hr_notifications(
+    hr_device: btleplug::platform::Peripheral,
+    state: Arc<Mutex<SharedState>>,
+) -> Result<()> {
+    // Look for the Heart Rate Measurement characteristic.
+    use uuid::Uuid;
+
+    let hr_uuid = Uuid::parse_str("00002A37-0000-1000-8000-00805F9B34FB")?;
+    let hr_char = hr_device
+        .characteristics()
+        .into_iter()
+        .find(|c| c.uuid == hr_uuid)
+        .ok_or(anyhow::anyhow!("HR characteristic not found"))?;
+
+    hr_device.subscribe(&hr_char).await?;
+    println!("Subscribed to HR notifications.");
+
+    let mut notif_stream = hr_device.notifications().await?;
+    while let Some(data) = notif_stream.next().await {
+        // According to the spec, the first byte is flags, next is the HR value.
+        if data.value.len() >= 2 {
+            let flags = data.value[0];
+            let hr = if flags & 0x01 == 0 {
+                // 8-bit heart rate
+                data.value[1] as u32
+            } else if data.value.len() >= 3 {
+                // 16-bit heart rate
+                u16::from_le_bytes([data.value[1], data.value[2]]) as u32
+            } else {
+                0
+            };
+            let mut s = state.lock().unwrap();
+            s.current_hr = hr;
+        }
+    }
     Ok(())
 }
 
-/// Simulated BLE heart rate monitor task:
-/// In a real application, use `btleplug` to connect and subscribe to the Heart Rate Measurement characteristic.
-async fn simulate_hr_monitor(state: Arc<Mutex<SharedState>>) {
-    let mut interval = time::interval(Duration::from_secs(1));
-    let mut hr_value = 130; // starting HR value
-    loop {
-        interval.tick().await;
-        // Simulate a gradual increase then reset of the heart rate
-        hr_value = if hr_value < 160 { hr_value + 1 } else { 130 };
-        let mut data = state.lock().unwrap();
-        data.current_hr = hr_value;
-    }
-}
+/// Subscribe to Trainer notifications for Indoor Bike Data (characteristic UUID 0x2A5B).
+async fn run_trainer_notifications(
+    trainer_device: btleplug::platform::Peripheral,
+    state: Arc<Mutex<SharedState>>,
+) -> Result<()> {
+    // Look for the Indoor Bike Data characteristic.
+    use uuid::Uuid;
 
-/// Simulated BLE trainer data task:
-/// In a real application, use `btleplug` to connect and subscribe to FTMS characteristics.
-async fn simulate_trainer_data(state: Arc<Mutex<SharedState>>) {
-    let mut interval = time::interval(Duration::from_secs(1));
-    let mut cadence_value = 80; // starting cadence value
-    loop {
-        interval.tick().await;
-        // Simulate cadence changes
-        cadence_value = if cadence_value < 95 {
-            cadence_value + 1
-        } else {
-            80
-        };
-        let mut data = state.lock().unwrap();
-        // Simulate that current power moves gradually toward the target power
-        if data.current_power < data.target_power {
-            data.current_power += 5;
-        } else if data.current_power > data.target_power {
-            data.current_power -= 5;
+    let bike_uuid = Uuid::parse_str("00002A5B-0000-1000-8000-00805F9B34FB")?;
+    let bike_data_char = trainer_device
+        .characteristics()
+        .into_iter()
+        .find(|c| c.uuid == bike_uuid)
+        .ok_or(anyhow::anyhow!("Indoor Bike Data characteristic not found"))?;
+
+    trainer_device.subscribe(&bike_data_char).await?;
+    println!("Subscribed to Trainer notifications.");
+
+    let mut notif_stream = trainer_device.notifications().await?;
+    while let Some(data) = notif_stream.next().await {
+        // This is a simplified parser. The FTMS Indoor Bike Data characteristic can be complex.
+        // Here, we assume the first two bytes are instantaneous power (u16 little-endian)
+        // and the third byte is cadence.
+        if data.value.len() >= 3 {
+            let power = u16::from_le_bytes([data.value[0], data.value[1]]) as u32;
+            let cadence = data.value[2] as u32;
+            let mut s = state.lock().unwrap();
+            s.current_power = power;
+            s.cadence = cadence;
         }
-        data.cadence = cadence_value;
     }
+    Ok(())
 }
 
-/// Control loop that adjusts the target power based on the heart rate error
+// =====================
+// CONTROL LOOP, CSV LOGGING & TERMINAL UI
+// =====================
+
+/// Control loop: adjusts target power based on heart rate error using a proportional controller.
 async fn control_loop(state: Arc<Mutex<SharedState>>) {
     let mut interval = time::interval(Duration::from_secs(1));
-    // Proportional gain parameter: a user-adjustable setting for smoother response
-    let k: f32 = 1.0;
+    let k: f32 = 1.0; // Proportional gain (user-adjustable for smoother response)
     loop {
         interval.tick().await;
         let mut data = state.lock().unwrap();
         let error = data.target_hr as i32 - data.current_hr as i32;
-        // Calculate power adjustment using a proportional controller
         let adjustment = (k * error as f32).round() as i32;
         let new_power = data.target_power as i32 + adjustment;
-        // Clamp the target power between 0 and 400 watts (typical limits)
         data.target_power = new_power.clamp(0, 400) as u32;
-
-        // In a real application, write the new power target to the trainer via BLE here.
+        // In a full implementation, write the new target power to the trainer via BLE here.
     }
 }
 
-/// Terminal UI task: clears the screen and prints current state every 500ms
-async fn terminal_ui(state: Arc<Mutex<SharedState>>) {
-    let mut interval = time::interval(Duration::from_millis(500));
-    loop {
-        interval.tick().await;
-        // Clear the terminal screen
-        execute!(stdout(), Clear(ClearType::All)).unwrap();
-        let data = state.lock().unwrap();
-        let elapsed = data.start_time.elapsed().as_secs();
-        println!("=== HearTrace ===");
-        println!("Elapsed Time: {} sec", elapsed);
-        println!("Current HR: {} bpm", data.current_hr);
-        println!("Current Power: {} W", data.current_power);
-        println!("Cadence: {} rpm", data.cadence);
-        println!("Target HR: {} bpm", data.target_hr);
-        println!("Target Power: {} W", data.target_power);
-        println!("\nPress Ctrl+C to exit.");
-    }
-}
-
-/// CSV Logging task: writes a record to 'workout.csv' every second
+/// CSV logging task: writes a record to 'workout.csv' every second.
 async fn csv_logging_task(state: Arc<Mutex<SharedState>>) -> Result<()> {
     use std::fs::OpenOptions;
-    use std::io::Write;
 
     let file_path = "workout.csv";
     let mut wtr = csv::Writer::from_writer(
@@ -186,4 +245,76 @@ async fn csv_logging_task(state: Arc<Mutex<SharedState>>) -> Result<()> {
         wtr.serialize(record)?;
         wtr.flush()?;
     }
+}
+
+/// Terminal UI: clears and redraws the screen every 500ms with the latest state.
+async fn terminal_ui(state: Arc<Mutex<SharedState>>) {
+    let mut interval = time::interval(Duration::from_millis(500));
+    loop {
+        interval.tick().await;
+        execute!(stdout(), Clear(ClearType::All)).unwrap();
+        let data = state.lock().unwrap();
+        let elapsed = data.start_time.elapsed().as_secs();
+        println!("=== HearTrace ===");
+        println!("Elapsed Time: {} sec", elapsed);
+        println!("Current HR: {} bpm", data.current_hr);
+        println!("Current Power: {} W", data.current_power);
+        println!("Cadence: {} rpm", data.cadence);
+        println!("Target HR: {} bpm", data.target_hr);
+        println!("Target Power: {} W", data.target_power);
+        println!("\nPress Ctrl+C to exit.");
+    }
+}
+
+// =====================
+// MAIN FUNCTION
+// =====================
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Load configuration from config.toml.
+    let config = load_config()?;
+    println!("Loaded config: {:?}", config);
+
+    // Initialize shared state.
+    let shared_state = Arc::new(Mutex::new(SharedState::new()));
+
+    // Scan for devices and connect.
+    let (hr_device, trainer_device) = connect_devices(&config).await?;
+
+    // Spawn tasks for BLE notifications.
+    let hr_state = shared_state.clone();
+    let hr_task = tokio::spawn(async move {
+        if let Err(e) = run_hr_notifications(hr_device, hr_state).await {
+            eprintln!("HR notifications error: {:?}", e);
+        }
+    });
+
+    let trainer_state = shared_state.clone();
+    let trainer_task = tokio::spawn(async move {
+        if let Err(e) = run_trainer_notifications(trainer_device, trainer_state).await {
+            eprintln!("Trainer notifications error: {:?}", e);
+        }
+    });
+
+    // Spawn control loop and CSV logging tasks.
+    let control_state = shared_state.clone();
+    tokio::spawn(async move {
+        control_loop(control_state).await;
+    });
+
+    let log_state = shared_state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = csv_logging_task(log_state).await {
+            eprintln!("CSV logging error: {:?}", e);
+        }
+    });
+
+    // Run the terminal UI on the main task.
+    terminal_ui(shared_state).await;
+
+    // Await the BLE tasks (though terminal_ui is blocking until exit).
+    let _ = tokio::join!(hr_task, trainer_task);
+
+    Ok(())
 }

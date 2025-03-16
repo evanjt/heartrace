@@ -1,0 +1,5 @@
+# Name (or substring) of the Bluetooth Heart Rate device.
+heart_rate_device = "Garmin"
+
+# Name (or substring) of the Bluetooth Trainer device.
+trainer_device = "Kickr"
