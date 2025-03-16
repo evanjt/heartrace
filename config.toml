@@ -1,5 +1,5 @@
-# Name (or substring) of the Bluetooth Heart Rate device.
-heart_rate_device = "Garmin"
-
-# Name (or substring) of the Bluetooth Trainer device.
-trainer_device = "Kickr"
+target_hr = 125
+ftp = 150
+ramp_rate = 5
+hr_device_id = ""
+trainer_device_id = ""
