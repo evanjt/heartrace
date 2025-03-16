@@ -11,10 +11,10 @@ use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::fs::OpenOptions;
-use std::io::stdout;
+use std::io::{Write, stdin, stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio::time;
 use tui::{
     Terminal,
@@ -35,8 +35,8 @@ struct Config {
     target_hr: u32,                    // desired heart rate
     ftp: u32,                          // Functional Threshold Power (max power), in Watts
     ramp_rate: u32,                    // max power change per control loop iteration (W)
-    hr_device_id: Option<String>,      // Optional: previously selected HR device ID
-    trainer_device_id: Option<String>, // Optional: previously selected trainer device ID
+    hr_device_id: Option<String>,      // previously selected HR device id
+    trainer_device_id: Option<String>, // previously selected trainer device id
 }
 
 impl Default for Config {
@@ -53,7 +53,7 @@ impl Default for Config {
 
 fn load_config() -> Result<Config> {
     let config_str = std::fs::read_to_string("config.toml").unwrap_or_default();
-    if config_str.is_empty() {
+    if config_str.trim().is_empty() {
         Ok(Config::default())
     } else {
         let config: Config = toml::from_str(&config_str)?;
@@ -80,20 +80,20 @@ struct HistoryPoint {
 }
 
 // =====================
-// SHARED STATE & CSV LOGGING
+// SHARED STATE
 // =====================
 
 struct SharedState {
     current_hr: u32,
-    current_power: u32, // Measured power from trainer notifications.
+    current_power: u32, // measured power from trainer notifications
     cadence: u32,
     target_hr: u32,
-    target_power: u32,    // Computed ideal power based on HR error.
-    last_sent_power: u32, // The last power value "sent" to the trainer.
-    ftp: u32,             // Functional Threshold Power (max power)
-    ramp_rate: u32,       // Maximum change (W) per control loop iteration.
+    target_power: u32,    // computed ideal target power
+    last_sent_power: u32, // last power command sent
+    ftp: u32,             // Functional Threshold Power
+    ramp_rate: u32,       // max change per control loop iteration (W)
     start_time: Instant,
-    history: Vec<HistoryPoint>, // Last 60 seconds of data.
+    history: Vec<HistoryPoint>, // history over last 60 sec
 }
 
 impl SharedState {
@@ -121,6 +121,7 @@ struct LogRecord {
     power: u32,
     cadence: u32,
     target_hr: u32,
+    ideal_power: u32,
 }
 
 // =====================
@@ -133,8 +134,7 @@ enum SelectionStage {
     Trainer,
 }
 
-struct App {
-    // Devices stored with a stable local id, name, RSSI, and Peripheral.
+struct AppTUI {
     devices: Vec<(u32, String, i16, Peripheral)>,
     selected_index: usize,
     stage: SelectionStage,
@@ -143,7 +143,7 @@ struct App {
     next_id: u32,
 }
 
-impl App {
+impl AppTUI {
     fn new() -> Self {
         Self {
             devices: Vec::new(),
@@ -160,8 +160,6 @@ impl App {
 // HELPER FUNCTION: RSSI BAR
 // =====================
 
-/// Computes a 10-character wide signal strength bar and a color based on the RSSI.
-/// Excellent = -40, Poor = -100.
 fn rssi_bar(rssi: i16) -> (String, Color) {
     let max_rssi = -40;
     let min_rssi = -100;
@@ -185,8 +183,11 @@ fn rssi_bar(rssi: i16) -> (String, Color) {
 // BLE NOTIFICATIONS
 // =====================
 
-/// Subscribes to HR notifications using the standard HR Measurement UUID.
-async fn run_hr_notifications(hr_device: Peripheral, state: Arc<Mutex<SharedState>>) -> Result<()> {
+async fn run_hr_notifications(
+    hr_device: Peripheral,
+    state: Arc<Mutex<SharedState>>,
+    mut shutdown: broadcast::Receiver<()>,
+) -> anyhow::Result<()> {
     let hr_uuid = Uuid::parse_str("00002A37-0000-1000-8000-00805F9B34FB")?;
     let hr_char = hr_device
         .characteristics()
@@ -194,50 +195,55 @@ async fn run_hr_notifications(hr_device: Peripheral, state: Arc<Mutex<SharedStat
         .find(|c| c.uuid == hr_uuid)
         .ok_or(anyhow::anyhow!("HR characteristic not found"))?;
     hr_device.subscribe(&hr_char).await?;
-
     let mut notif_stream = hr_device.notifications().await?;
-    while let Some(data) = notif_stream.next().await {
-        if data.value.len() >= 2 {
-            let flags = data.value[0];
-            let hr = if flags & 0x01 == 0 {
-                data.value[1] as u32
-            } else if data.value.len() >= 3 {
-                u16::from_le_bytes([data.value[1], data.value[2]]) as u32
-            } else {
-                0
-            };
-            let mut s = state.lock().await;
-            s.current_hr = hr;
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            maybe_data = notif_stream.next() => {
+                if let Some(data) = maybe_data {
+                    if data.value.len() >= 2 {
+                        let flags = data.value[0];
+                        let hr = if flags & 0x01 == 0 {
+                            data.value[1] as u32
+                        } else if data.value.len() >= 3 {
+                            u16::from_le_bytes([data.value[1], data.value[2]]) as u32
+                        } else { 0 };
+                        let mut s = state.lock().await;
+                        s.current_hr = hr;
+                    }
+                } else { break; }
+            }
         }
     }
     Ok(())
 }
 
-/// Subscribes to Trainer notifications using the FTMS Indoor Bike Data characteristic (UUID: 0x2AD2).
-/// Parses the data as follows:
-/// - Bytes 0-1: Flags (ignored)
-/// - Bytes 2-3: Instantaneous Speed (ignored)
-/// - Bytes 4-5: Instantaneous Cadence (in 1/2 rpm)
-/// - Bytes 6-7: Instantaneous Power (in Watts, signed 16-bit)
 async fn run_trainer_notifications(
     trainer_device: Peripheral,
     state: Arc<Mutex<SharedState>>,
-) -> Result<()> {
+    mut shutdown: broadcast::Receiver<()>,
+) -> anyhow::Result<()> {
     let bike_uuid = Uuid::parse_str("00002AD2-0000-1000-8000-00805F9B34FB")?;
     let characteristics = trainer_device.characteristics();
     let available_chars: Vec<String> = characteristics.iter().map(|c| c.uuid.to_string()).collect();
     let bike_data_char = characteristics.iter().find(|c| c.uuid == bike_uuid);
-
     if let Some(charac) = bike_data_char {
         trainer_device.subscribe(charac).await?;
         let mut notif_stream = trainer_device.notifications().await?;
-        while let Some(data) = notif_stream.next().await {
-            let mut s = state.lock().await;
-            if data.value.len() >= 8 {
-                let cadence = u16::from_le_bytes([data.value[4], data.value[5]]) as u32 / 2;
-                let power = i16::from_le_bytes([data.value[6], data.value[7]]) as i32;
-                s.current_power = power.unsigned_abs();
-                s.cadence = cadence;
+        loop {
+            tokio::select! {
+                _ = shutdown.recv() => break,
+                maybe_data = notif_stream.next() => {
+                    if let Some(data) = maybe_data {
+                        let mut s = state.lock().await;
+                        if data.value.len() >= 8 {
+                            let cadence = u16::from_le_bytes([data.value[4], data.value[5]]) as u32 / 2;
+                            let power = i16::from_le_bytes([data.value[6], data.value[7]]) as i32;
+                            s.current_power = power.unsigned_abs();
+                            s.cadence = cadence;
+                        }
+                    } else { break; }
+                }
             }
         }
     } else {
@@ -250,8 +256,6 @@ async fn run_trainer_notifications(
     Ok(())
 }
 
-/// Sends a target power command to the trainer using the FTMS Control Point (UUID: 0x2AD9).
-/// Command format: [0x05, <power_low_byte>, <power_high_byte>]
 async fn set_trainer_target_power(trainer_device: &Peripheral, power: u16) -> Result<()> {
     let control_point_uuid = Uuid::parse_str("00002AD9-0000-1000-8000-00805F9B34FB")?;
     let characteristics = trainer_device.characteristics();
@@ -277,40 +281,38 @@ async fn set_trainer_target_power(trainer_device: &Peripheral, power: u16) -> Re
 // CONTROL LOOP & CSV LOGGING
 // =====================
 
-/// A ramping algorithm that adjusts the target power slowly until the target HR is reached.
-/// In each control loop iteration, if the current HR is more than 3 bpm below target,
-/// increase the target power by up to ramp_rate (W). If above target by more than 3 bpm,
-/// decrease target power. Clamp target power to [0, ftp]. Then send the command.
-async fn control_loop(trainer_device: Peripheral, state: Arc<Mutex<SharedState>>) {
+async fn control_loop(
+    trainer_device: Peripheral,
+    state: Arc<Mutex<SharedState>>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
     let mut interval = time::interval(Duration::from_secs(2));
     loop {
-        interval.tick().await;
-        {
-            let mut data = state.lock().await;
-            let hr_error = data.target_hr as i32 - data.current_hr as i32;
-            let delta = if hr_error > 3 {
-                data.ramp_rate as i32
-            } else if hr_error < -3 {
-                -(data.ramp_rate as i32)
-            } else {
-                0
-            };
-            let new_power = (data.target_power as i32 + delta).clamp(0, data.ftp as i32) as u32;
-            data.target_power = new_power;
-            data.last_sent_power = new_power;
-        }
-        let target_power = {
-            let data = state.lock().await;
-            data.target_power as u16
-        };
-        if let Err(e) = set_trainer_target_power(&trainer_device, target_power).await {
-            eprintln!("Failed to send power command: {:?}", e);
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            _ = interval.tick() => {
+                let target_power = {
+                    let mut data = state.lock().await;
+                    let hr_error = data.target_hr as i32 - data.current_hr as i32;
+                    let delta = if hr_error > 3 { data.ramp_rate as i32 }
+                        else if hr_error < -3 { -(data.ramp_rate as i32) }
+                        else { 0 };
+                    let new_power = (data.target_power as i32 + delta).clamp(0, data.ftp as i32) as u32;
+                    data.target_power = new_power;
+                    data.last_sent_power = new_power;
+                    new_power as u16
+                };
+                if let Err(e) = set_trainer_target_power(&trainer_device, target_power).await {
+                    eprintln!("Failed to send power command: {:?}", e);
+                }
+            }
         }
     }
 }
-
-/// Logs workout data to CSV every second and updates a history sliding window (last 60 sec).
-async fn csv_logging_task(state: Arc<Mutex<SharedState>>) -> Result<()> {
+async fn csv_logging_task(
+    state: Arc<Mutex<SharedState>>,
+    mut shutdown: broadcast::Receiver<()>,
+) -> Result<()> {
     let file_path = "workout.csv";
     let mut wtr = csv::Writer::from_writer(
         OpenOptions::new()
@@ -320,35 +322,53 @@ async fn csv_logging_task(state: Arc<Mutex<SharedState>>) -> Result<()> {
     );
     let mut interval = time::interval(Duration::from_secs(1));
     loop {
-        interval.tick().await;
-        let mut data = state.lock().await;
-        let elapsed_sec = data.start_time.elapsed().as_secs();
-        let history_point = HistoryPoint {
-            time: elapsed_sec,
-            heart_rate: data.current_hr,
-            power: data.current_power,
-            cadence: data.cadence,
-            target_power: data.target_power,
-        };
-        data.history.push(history_point);
-        while let Some(first) = data.history.first() {
-            if elapsed_sec - first.time > 60 {
-                data.history.remove(0);
-            } else {
-                break;
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            _ = interval.tick() => {
+                // Destructure values from the state in a temporary scope.
+                let (elapsed_sec, current_hr, current_power, cadence, target_hr, ideal_power) = {
+                    let data = state.lock().await;
+                    (
+                        data.start_time.elapsed().as_secs(),
+                        data.current_hr,
+                        data.current_power,
+                        data.cadence,
+                        data.target_hr,
+                        data.target_power,
+                    )
+                };
+                {
+                    let mut data = state.lock().await;
+                    data.history.push(HistoryPoint {
+                        time: elapsed_sec,
+                        heart_rate: current_hr,
+                        power: current_power,
+                        cadence,
+                        target_power: ideal_power,
+                    });
+                    while let Some(first) = data.history.first() {
+                        if elapsed_sec - first.time > 60 {
+                            data.history.remove(0);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let record = LogRecord {
+                    timestamp: Local::now().to_rfc3339(),
+                    elapsed_sec,
+                    heart_rate: current_hr,
+                    power: current_power,
+                    cadence,
+                    target_hr,
+                    ideal_power,
+                };
+                wtr.serialize(record)?;
+                wtr.flush()?;
             }
         }
-        let record = LogRecord {
-            timestamp: Local::now().to_rfc3339(),
-            elapsed_sec,
-            heart_rate: data.current_hr,
-            power: data.current_power,
-            cadence: data.cadence,
-            target_hr: data.target_hr,
-        };
-        wtr.serialize(record)?;
-        wtr.flush()?;
     }
+    Ok(())
 }
 
 // =====================
@@ -358,120 +378,119 @@ async fn csv_logging_task(state: Arc<Mutex<SharedState>>) -> Result<()> {
 fn draw_live_dashboard<B: tui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state: &SharedState,
-) -> Result<()> {
-    terminal.draw(|f| {
-        let size = f.size();
-        // Split vertically: top block for metrics (40% height), bottom block for chart.
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(8), Constraint::Min(10)].as_ref())
-            .split(size);
+) -> Result<(), anyhow::Error> {
+    terminal
+        .draw(|f| {
+            let size = f.size();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(8), Constraint::Min(10)].as_ref())
+                .split(size);
+            let top_block = Block::default()
+                .borders(tui::widgets::Borders::ALL)
+                .title("Metrics");
+            let elapsed = state.start_time.elapsed().as_secs();
+            let top_text = vec![
+                Spans::from(Span::raw(format!("Elapsed Time: {} sec", elapsed))),
+                Spans::from(Span::raw(format!("Current HR: {} bpm", state.current_hr))),
+                Spans::from(Span::raw(format!(
+                    "Current Power: {} W",
+                    state.current_power
+                ))),
+                Spans::from(Span::raw(format!("Cadence: {} rpm", state.cadence))),
+                Spans::from(Span::raw(format!("Target HR: {} bpm", state.target_hr))),
+                Spans::from(Span::raw(format!("Ideal Power: {} W", state.target_power))),
+                Spans::from(Span::raw(format!(
+                    "Last Sent Power: {} W",
+                    state.last_sent_power
+                ))),
+            ];
+            let top_paragraph = tui::widgets::Paragraph::new(top_text).block(top_block);
+            f.render_widget(top_paragraph, chunks[0]);
 
-        // Top block: Metrics.
-        let top_block = Block::default()
-            .borders(tui::widgets::Borders::ALL)
-            .title("Metrics");
-        let elapsed = state.start_time.elapsed().as_secs();
-        let top_text = vec![
-            Spans::from(Span::raw(format!("Elapsed Time: {} sec", elapsed))),
-            Spans::from(Span::raw(format!("Current HR: {} bpm", state.current_hr))),
-            Spans::from(Span::raw(format!(
-                "Current Power: {} W",
-                state.current_power
-            ))),
-            Spans::from(Span::raw(format!("Cadence: {} rpm", state.cadence))),
-            Spans::from(Span::raw(format!("Target HR: {} bpm", state.target_hr))),
-            Spans::from(Span::raw(format!("Ideal Power: {} W", state.target_power))),
-            Spans::from(Span::raw(format!(
-                "Last Sent Power: {} W",
-                state.last_sent_power
-            ))),
-        ];
-        let top_paragraph = tui::widgets::Paragraph::new(top_text).block(top_block);
-        f.render_widget(top_paragraph, chunks[0]);
-
-        // Bottom block: Chart.
-        let x_max = state.start_time.elapsed().as_secs() as f64;
-        let x_min = if x_max > 60.0 { x_max - 60.0 } else { 0.0 };
-        let y_max = state.ftp as f64;
-        let hr_data: Vec<(f64, f64)> = state
-            .history
-            .iter()
-            .map(|p| (p.time as f64, p.heart_rate as f64))
-            .collect();
-        let cadence_data: Vec<(f64, f64)> = state
-            .history
-            .iter()
-            .map(|p| (p.time as f64, p.cadence as f64))
-            .collect();
-        let power_data: Vec<(f64, f64)> = state
-            .history
-            .iter()
-            .map(|p| (p.time as f64, p.power as f64))
-            .collect();
-        let target_power_data: Vec<(f64, f64)> = state
-            .history
-            .iter()
-            .map(|p| (p.time as f64, p.target_power as f64))
-            .collect();
-
-        let datasets = vec![
-            Dataset::default()
-                .name("HR")
-                .marker(tui::symbols::Marker::Dot)
-                .style(Style::default().fg(Color::Red))
-                .data(&hr_data),
-            Dataset::default()
-                .name("Cadence")
-                .marker(tui::symbols::Marker::Braille)
-                .style(Style::default().fg(Color::Green))
-                .data(&cadence_data),
-            Dataset::default()
-                .name("Power")
-                .marker(tui::symbols::Marker::Dot)
-                .style(Style::default().fg(Color::Blue))
-                .data(&power_data),
-            Dataset::default()
-                .name("Ideal Power")
-                .marker(tui::symbols::Marker::Braille)
-                .style(Style::default().fg(Color::Magenta))
-                .data(&target_power_data),
-        ];
-
-        let chart = Chart::new(datasets)
-            .block(
-                Block::default()
-                    .title("History (Last 60 sec)")
-                    .borders(tui::widgets::Borders::ALL),
-            )
-            .x_axis(
-                Axis::default()
-                    .title("Time (s)")
-                    .style(Style::default().fg(Color::Gray))
-                    .bounds([x_min, x_max])
-                    .labels(vec![
-                        Span::raw(format!("{:.0}", x_min)),
-                        Span::raw(format!("{:.0}", (x_min + x_max) / 2.0)),
-                        Span::raw(format!("{:.0}", x_max)),
-                    ]),
-            )
-            .y_axis(
-                Axis::default()
-                    .title("Value")
-                    .style(Style::default().fg(Color::Gray))
-                    .bounds([0.0, y_max])
-                    .labels(vec![
-                        Span::raw("0"),
-                        Span::raw(format!("{:.0}", y_max / 2.0)),
-                        Span::raw(format!("{:.0}", y_max)),
-                    ]),
-            );
-        f.render_widget(chart, chunks[1]);
-    })?;
-    Ok(())
+            let x_max = state.start_time.elapsed().as_secs() as f64;
+            let x_min = if x_max > 60.0 { x_max - 60.0 } else { 0.0 };
+            let y_max = state.ftp as f64;
+            let hr_data: Vec<(f64, f64)> = state
+                .history
+                .iter()
+                .map(|p| (p.time as f64, p.heart_rate as f64))
+                .collect();
+            let cadence_data: Vec<(f64, f64)> = state
+                .history
+                .iter()
+                .map(|p| (p.time as f64, p.cadence as f64))
+                .collect();
+            let power_data: Vec<(f64, f64)> = state
+                .history
+                .iter()
+                .map(|p| (p.time as f64, p.power as f64))
+                .collect();
+            let target_power_data: Vec<(f64, f64)> = state
+                .history
+                .iter()
+                .map(|p| (p.time as f64, p.target_power as f64))
+                .collect();
+            let datasets = vec![
+                Dataset::default()
+                    .name("HR")
+                    .marker(tui::symbols::Marker::Dot)
+                    .style(Style::default().fg(Color::Red))
+                    .data(&hr_data),
+                Dataset::default()
+                    .name("Cadence")
+                    .marker(tui::symbols::Marker::Braille)
+                    .style(Style::default().fg(Color::Green))
+                    .data(&cadence_data),
+                Dataset::default()
+                    .name("Power")
+                    .marker(tui::symbols::Marker::Dot)
+                    .style(Style::default().fg(Color::Blue))
+                    .data(&power_data),
+                Dataset::default()
+                    .name("Ideal Power")
+                    .marker(tui::symbols::Marker::Braille)
+                    .style(Style::default().fg(Color::Magenta))
+                    .data(&target_power_data),
+            ];
+            let chart = Chart::new(datasets)
+                .block(
+                    Block::default()
+                        .title("History (Last 60 sec)")
+                        .borders(tui::widgets::Borders::ALL),
+                )
+                .x_axis(
+                    Axis::default()
+                        .title("Time (s)")
+                        .style(Style::default().fg(Color::Gray))
+                        .bounds([x_min, x_max])
+                        .labels(vec![
+                            Span::raw(format!("{:.0}", x_min)),
+                            Span::raw(format!("{:.0}", (x_min + x_max) / 2.0)),
+                            Span::raw(format!("{:.0}", x_max)),
+                        ]),
+                )
+                .y_axis(
+                    Axis::default()
+                        .title("Value")
+                        .style(Style::default().fg(Color::Gray))
+                        .bounds([0.0, y_max])
+                        .labels(vec![
+                            Span::raw("0"),
+                            Span::raw(format!("{:.0}", y_max / 2.0)),
+                            Span::raw(format!("{:.0}", y_max)),
+                        ]),
+                );
+            f.render_widget(chart, chunks[1]);
+        })
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
 }
 
-async fn live_data_tui(state: Arc<Mutex<SharedState>>) -> Result<()> {
+async fn live_data_tui(
+    state: Arc<Mutex<SharedState>>,
+    shutdown: broadcast::Sender<()>,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -485,6 +504,7 @@ async fn live_data_tui(state: Arc<Mutex<SharedState>>) -> Result<()> {
         if event::poll(Duration::from_millis(200))? {
             if let CEvent::Key(KeyEvent { code, .. }) = event::read()? {
                 if code == KeyCode::Char('q') {
+                    let _ = shutdown.send(());
                     break;
                 }
             }
@@ -497,77 +517,73 @@ async fn live_data_tui(state: Arc<Mutex<SharedState>>) -> Result<()> {
 }
 
 // =====================
-// DEVICE SELECTION TUI (using tui crate)
+// DEVICE SELECTION TUI
 // =====================
-
 fn draw_device_selection<B: tui::backend::Backend>(
     terminal: &mut Terminal<B>,
-    app: &App,
-) -> Result<()> {
-    terminal.draw(|f| {
-        let size = f.size();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(2)
-            .constraints(
-                [
-                    Constraint::Length(3),
-                    Constraint::Min(2),
-                    Constraint::Length(3),
-                ]
-                .as_ref(),
-            )
-            .split(size);
-
-        let title = match app.stage {
-            SelectionStage::Hr => "Select Heart Rate Device",
-            SelectionStage::Trainer => "Select Trainer Device",
-        };
-        let header = tui::widgets::Paragraph::new(title).block(
-            Block::default()
-                .borders(tui::widgets::Borders::ALL)
-                .title("Device Selection"),
-        );
-        f.render_widget(header, chunks[0]);
-
-        let rows: Vec<Row> = app
-            .devices
-            .iter()
-            .map(|(_id, name, rssi, _)| {
-                let (bar, color) = rssi_bar(*rssi);
-                Row::new(vec![
-                    Cell::from(name.to_string()),
-                    Cell::from(rssi.to_string()),
-                    Cell::from(Span::styled(bar, Style::default().fg(color))),
-                ])
-            })
-            .collect();
-
-        let table = Table::new(rows)
-            .header(Row::new(vec!["Name", "RSSI", "Signal"]))
-            .block(
+    app: &AppTUI,
+) -> Result<(), anyhow::Error> {
+    terminal
+        .draw(|f| {
+            let size = f.size();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(2)
+                .constraints(
+                    [
+                        Constraint::Length(3),
+                        Constraint::Min(2),
+                        Constraint::Length(3),
+                    ]
+                    .as_ref(),
+                )
+                .split(size);
+            let title = match app.stage {
+                SelectionStage::Hr => "Select Heart Rate Device",
+                SelectionStage::Trainer => "Select Trainer Device",
+            };
+            let header = tui::widgets::Paragraph::new(title).block(
                 Block::default()
                     .borders(tui::widgets::Borders::ALL)
-                    .title("Discovered Devices"),
+                    .title("Device Selection"),
+            );
+            f.render_widget(header, chunks[0]);
+            let rows: Vec<Row> = app
+                .devices
+                .iter()
+                .map(|(_id, name, rssi, _)| {
+                    let (bar, color) = rssi_bar(*rssi);
+                    Row::new(vec![
+                        Cell::from(name.to_string()),
+                        Cell::from(rssi.to_string()),
+                        Cell::from(Span::styled(bar, Style::default().fg(color))),
+                    ])
+                })
+                .collect();
+            let table = Table::new(rows)
+                .header(Row::new(vec!["Name", "RSSI", "Signal"]))
+                .block(
+                    Block::default()
+                        .borders(tui::widgets::Borders::ALL)
+                        .title("Discovered Devices"),
+                )
+                .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+                .widths(&[
+                    Constraint::Percentage(50),
+                    Constraint::Length(10),
+                    Constraint::Length(15),
+                ]);
+            let mut table_state = tui::widgets::TableState::default();
+            table_state.select(Some(app.selected_index));
+            f.render_stateful_widget(table, chunks[1], &mut table_state);
+            let footer = tui::widgets::Paragraph::new(
+                "Use Up/Down arrows to navigate, Enter to select. (Press 'q' to quit)",
             )
-            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
-            .widths(&[
-                Constraint::Percentage(50),
-                Constraint::Length(10),
-                Constraint::Length(15),
-            ]);
-
-        let mut table_state = tui::widgets::TableState::default();
-        table_state.select(Some(app.selected_index));
-        f.render_stateful_widget(table, chunks[1], &mut table_state);
-
-        let footer = tui::widgets::Paragraph::new(
-            "Use Up/Down arrows to navigate, Enter to select. (Press 'q' to quit)",
-        )
-        .block(Block::default().borders(tui::widgets::Borders::ALL));
-        f.render_widget(footer, chunks[2]);
-    })?;
-    Ok(())
+            .block(Block::default().borders(tui::widgets::Borders::ALL));
+            f.render_widget(footer, chunks[2]);
+        })
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
 }
 
 async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
@@ -578,17 +594,14 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
         .next()
         .ok_or(anyhow::anyhow!("No BLE adapters found"))?;
     adapter.start_scan(Default::default()).await?;
-
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
-    let mut app = App::new();
+    let mut app = AppTUI::new();
     let start_scan = Instant::now();
     let mut selection_complete = false;
-
     while !selection_complete {
         let peripherals = adapter.peripherals().await?;
         let mut new_devices = Vec::new();
@@ -618,9 +631,7 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
         }
         new_devices.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
         app.devices = new_devices;
-
         draw_device_selection(&mut terminal, &app)?;
-
         if event::poll(Duration::from_millis(500))? {
             if let CEvent::Key(key) = event::read()? {
                 match key.code {
@@ -668,14 +679,12 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
     let hr_device = app
         .hr_device
         .ok_or(anyhow::anyhow!("No Heart Rate device selected"))?;
     let trainer_device = app
         .trainer_device
         .ok_or(anyhow::anyhow!("No Trainer device selected"))?;
-
     if !hr_device.is_connected().await? {
         hr_device.connect().await?;
     }
@@ -688,54 +697,235 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
 }
 
 // =====================
-// MAIN FUNCTION
+// START SCREEN & SETTINGS
+// =====================
+fn draw_start_screen<B: tui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    config: &Config,
+    hr_status: &str,
+    trainer_status: &str,
+) -> Result<(), anyhow::Error> {
+    terminal
+        .draw(|f| {
+            let size = f.size();
+            let block = Block::default()
+                .borders(tui::widgets::Borders::ALL)
+                .title("HearTrace - Start Screen");
+            f.render_widget(block, size);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(2)
+                .constraints(
+                    [
+                        Constraint::Length(7),
+                        Constraint::Length(3),
+                        Constraint::Min(3),
+                    ]
+                    .as_ref(),
+                )
+                .split(size);
+            let config_text = vec![
+                Spans::from(Span::raw(format!("Target HR: {} bpm", config.target_hr))),
+                Spans::from(Span::raw(format!("FTP: {} W", config.ftp))),
+                Spans::from(Span::raw(format!("Ramp Rate: {} W", config.ramp_rate))),
+                Spans::from(Span::raw(format!(
+                    "HR Device ID: {}",
+                    config.hr_device_id.as_deref().unwrap_or("Not set")
+                ))),
+                Spans::from(Span::raw(format!(
+                    "Trainer Device ID: {}",
+                    config.trainer_device_id.as_deref().unwrap_or("Not set")
+                ))),
+            ];
+            let status_text = vec![
+                Spans::from(Span::raw(format!("HR Device Status: {}", hr_status))),
+                Spans::from(Span::raw(format!(
+                    "Trainer Device Status: {}",
+                    trainer_status
+                ))),
+            ];
+            let options_text = vec![Spans::from(Span::raw(
+                "Options: [l] Live  [s] Settings  [d] Devices  [q] Quit",
+            ))];
+            let config_paragraph = tui::widgets::Paragraph::new(config_text).block(
+                Block::default()
+                    .borders(tui::widgets::Borders::ALL)
+                    .title("Configuration"),
+            );
+            let status_paragraph = tui::widgets::Paragraph::new(status_text).block(
+                Block::default()
+                    .borders(tui::widgets::Borders::ALL)
+                    .title("Device Status"),
+            );
+            let options_paragraph = tui::widgets::Paragraph::new(options_text)
+                .block(Block::default().borders(tui::widgets::Borders::ALL));
+            f.render_widget(config_paragraph, chunks[0]);
+            f.render_widget(status_paragraph, chunks[1]);
+            f.render_widget(options_paragraph, chunks[2]);
+        })
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
+
+async fn start_screen(config: &Config) -> Result<char> {
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    loop {
+        let hr_status = match lookup_device_status(&config.hr_device_id).await {
+            Ok(status) => status,
+            Err(_) => "Error".to_string(),
+        };
+        let trainer_status = match lookup_device_status(&config.trainer_device_id).await {
+            Ok(status) => status,
+            Err(_) => "Error".to_string(),
+        };
+        draw_start_screen(&mut terminal, config, &hr_status, &trainer_status)?;
+        if event::poll(Duration::from_millis(500))? {
+            if let CEvent::Key(KeyEvent { code, .. }) = event::read()? {
+                disable_raw_mode()?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                terminal.show_cursor()?;
+                if let KeyCode::Char(c) = code {
+                    return Ok(c);
+                }
+            }
+        }
+    }
+}
+
+fn settings_page(config: &mut Config) -> Result<()> {
+    println!("--- Settings ---");
+    println!("Current Target HR (bpm): {}", config.target_hr);
+    println!("Enter new Target HR (or press Enter to keep current):");
+    let mut input = String::new();
+    stdin().read_line(&mut input)?;
+    if let Ok(new_val) = input.trim().parse() {
+        config.target_hr = new_val;
+    }
+    input.clear();
+    println!("Current FTP (W): {}", config.ftp);
+    println!("Enter new FTP (or press Enter to keep current):");
+    stdin().read_line(&mut input)?;
+    if let Ok(new_val) = input.trim().parse() {
+        config.ftp = new_val;
+    }
+    input.clear();
+    println!("Current Ramp Rate (W per interval): {}", config.ramp_rate);
+    println!("Enter new Ramp Rate (or press Enter to keep current):");
+    stdin().read_line(&mut input)?;
+    if let Ok(new_val) = input.trim().parse() {
+        config.ramp_rate = new_val;
+    }
+    println!("Settings updated. Press Enter to continue.");
+    input.clear();
+    stdin().read_line(&mut input)?;
+    Ok(())
+}
+
+async fn lookup_device_status(device_id: &Option<String>) -> std::io::Result<String> {
+    if let Some(id_str) = device_id {
+        if let Ok(manager) = Manager::new().await {
+            if let Ok(adapters) = manager.adapters().await {
+                if let Some(adapter) = adapters.into_iter().next() {
+                    let _ = adapter.start_scan(Default::default()).await;
+                    time::sleep(Duration::from_secs(2)).await;
+                    if let Ok(peripherals) = adapter.peripherals().await {
+                        for p in peripherals {
+                            if p.id().to_string() == *id_str {
+                                return Ok("Found".into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok("Not found".into())
+    } else {
+        Ok("Not set".into())
+    }
+}
+
+// =====================
+// MAIN STATE MACHINE
 // =====================
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load configuration.
-    let config = load_config().unwrap_or_default();
-    // (Optionally, later save new config values from a settings page.)
+    let mut config = load_config().unwrap_or_default();
     println!(
         "Loaded config: target_hr={}, ftp={}, ramp_rate={}",
         config.target_hr, config.ftp, config.ramp_rate
     );
 
-    // Use device selection (or if config.hr_device_id and config.trainer_device_id are Some, auto-select those).
+    loop {
+        let choice = start_screen(&config).await?;
+        match choice {
+            'l' => break, // Launch live dashboard.
+            's' => {
+                disable_raw_mode()?;
+                println!();
+                settings_page(&mut config)?;
+                save_config(&config)?;
+            }
+            'd' => {
+                let (hr_device, trainer_device) = device_selection_tui().await?;
+                config.hr_device_id = Some(hr_device.id().to_string());
+                config.trainer_device_id = Some(trainer_device.id().to_string());
+                save_config(&config)?;
+            }
+            'q' => return Ok(()),
+            _ => {}
+        }
+    }
+
+    // Re-select devices (or use saved ones) for live dashboard.
     let (hr_device, trainer_device) = device_selection_tui().await?;
-    println!("Devices selected.");
+    config.hr_device_id = Some(hr_device.id().to_string());
+    config.trainer_device_id = Some(trainer_device.id().to_string());
+    save_config(&config)?;
 
     let shared_state = Arc::new(Mutex::new(SharedState::new(&config)));
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     let hr_state = shared_state.clone();
+    let mut hr_shutdown = shutdown_tx.subscribe();
     let hr_task = tokio::spawn(async move {
-        if let Err(e) = run_hr_notifications(hr_device, hr_state).await {
+        if let Err(e) = run_hr_notifications(hr_device, hr_state, hr_shutdown).await {
             eprintln!("HR notifications error: {:?}", e);
         }
     });
 
     let trainer_state = shared_state.clone();
-    let trainer_for_control = trainer_device.clone();
+    let mut trainer_shutdown = shutdown_tx.subscribe();
+    let trainer_for_notifications = trainer_device.clone();
     let trainer_task = tokio::spawn(async move {
-        if let Err(e) = run_trainer_notifications(trainer_device, trainer_state).await {
+        if let Err(e) =
+            run_trainer_notifications(trainer_for_notifications, trainer_state, trainer_shutdown)
+                .await
+        {
             eprintln!("Trainer notifications error: {:?}", e);
         }
     });
 
+    let mut control_shutdown = shutdown_tx.subscribe();
     let control_state = shared_state.clone();
+    let trainer_for_control = trainer_device.clone();
     tokio::spawn(async move {
-        control_loop(trainer_for_control, control_state).await;
+        control_loop(trainer_for_control, control_state, control_shutdown).await;
     });
 
+    let mut logging_shutdown = shutdown_tx.subscribe();
     let logging_state = shared_state.clone();
     tokio::spawn(async move {
-        if let Err(e) = csv_logging_task(logging_state).await {
+        if let Err(e) = csv_logging_task(logging_state, logging_shutdown).await {
             eprintln!("CSV logging error: {:?}", e);
         }
     });
 
-    live_data_tui(shared_state).await?;
-
+    live_data_tui(shared_state, shutdown_tx.clone()).await?;
     let _ = tokio::join!(hr_task, trainer_task);
     Ok(())
 }

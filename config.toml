@@ -1,5 +1,5 @@
 target_hr = 125
 ftp = 150
 ramp_rate = 5
-hr_device_id = ""
-trainer_device_id = ""
+hr_device_id = "hci0/dev_D1_6E_BE_52_06_C0"
+trainer_device_id = "hci0/dev_D2_04_20_EB_3D_7E"
