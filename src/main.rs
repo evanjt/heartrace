@@ -9,10 +9,11 @@ use crossterm::{
 };
 use futures::stream::StreamExt;
 use serde::Serialize;
-use std::cmp::{Ordering, Reverse};
-use std::io::{Stdout, Write, stdout};
-use std::sync::{Arc, Mutex};
+use std::cmp::Reverse;
+use std::io::{Write, stdout};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tokio::time;
 use tui::{
     Terminal,
@@ -28,14 +29,15 @@ use uuid::Uuid;
 // SHARED STATE & CSV LOGGING
 // =====================
 
-#[derive(Debug)]
 struct SharedState {
     current_hr: u32,
-    current_power: u32,
+    current_power: u32, // Measured power from trainer notifications.
     cadence: u32,
     target_hr: u32,
-    target_power: u32,
+    target_power: u32,    // Computed ideal power based on HR error.
+    last_sent_power: u32, // The last power value “sent” to the trainer.
     start_time: Instant,
+    trainer_raw_data: String, // Latest raw data string from the trainer.
 }
 
 impl SharedState {
@@ -44,9 +46,11 @@ impl SharedState {
             current_hr: 0,
             current_power: 0,
             cadence: 0,
-            target_hr: 140, // Default target HR.
+            target_hr: 140,
             target_power: 0,
+            last_sent_power: 0,
             start_time: Instant::now(),
+            trainer_raw_data: String::new(),
         }
     }
 }
@@ -72,16 +76,12 @@ enum SelectionStage {
 }
 
 struct App {
-    // Vector of devices with a stable local id, name, RSSI, and Peripheral.
+    // Devices stored with a stable local id, name, RSSI, and Peripheral.
     devices: Vec<(u32, String, i16, Peripheral)>,
-    // Currently highlighted index in the list.
     selected_index: usize,
-    // Which device are we selecting: HR or Trainer?
     stage: SelectionStage,
-    // Once selected, store the chosen peripherals.
     hr_device: Option<Peripheral>,
     trainer_device: Option<Peripheral>,
-    // Next stable id to assign.
     next_id: u32,
 }
 
@@ -102,8 +102,8 @@ impl App {
 // HELPER FUNCTION: RSSI BAR
 // =====================
 
-/// Computes a signal strength bar (10-character wide) and chooses a color based on the RSSI.
-/// Assumes excellent RSSI = -40, poor RSSI = -100.
+/// Computes a 10-character wide signal strength bar and a color based on the RSSI.
+/// Excellent = -40, Poor = -100.
 fn rssi_bar(rssi: i16) -> (String, Color) {
     let max_rssi = -40;
     let min_rssi = -100;
@@ -127,7 +127,7 @@ fn rssi_bar(rssi: i16) -> (String, Color) {
 // BLE NOTIFICATIONS
 // =====================
 
-/// Subscribes to Heart Rate notifications using the standard HR Measurement UUID.
+/// Subscribes to HR notifications using the standard HR Measurement UUID.
 async fn run_hr_notifications(hr_device: Peripheral, state: Arc<Mutex<SharedState>>) -> Result<()> {
     let hr_uuid = Uuid::parse_str("00002A37-0000-1000-8000-00805F9B34FB")?;
     let hr_char = hr_device
@@ -149,48 +149,89 @@ async fn run_hr_notifications(hr_device: Peripheral, state: Arc<Mutex<SharedStat
             } else {
                 0
             };
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock().await;
             s.current_hr = hr;
         }
     }
     Ok(())
 }
 
-/// Subscribes to Trainer notifications. If the Indoor Bike Data characteristic (UUID 0x2A5B)
-/// isn’t found, prints available characteristic UUIDs and logs raw data.
+/// Subscribes to Trainer notifications.
+/// Here we try interpreting the data using an alternative parsing:
+/// interpret bytes 2-3 as instantaneous power (e.g. in deci-watts)
+/// and byte 4 as cadence. The raw data is stored for display.
 async fn run_trainer_notifications(
     trainer_device: Peripheral,
     state: Arc<Mutex<SharedState>>,
 ) -> Result<()> {
-    let bike_uuid = Uuid::parse_str("00002A5B-0000-1000-8000-00805F9B34FB")?;
+    let bike_uuid = Uuid::parse_str("00002AD2-0000-1000-8000-00805F9B34FB")?;
     let characteristics = trainer_device.characteristics();
-    println!("Trainer device characteristics:");
-    for c in &characteristics {
-        println!("  UUID: {}", c.uuid);
-    }
-    let bike_data_char = characteristics
-        .into_iter()
-        .find(|c| c.uuid == bike_uuid)
-        .ok_or(anyhow::anyhow!(
-            "Indoor Bike Data characteristic not found. See above for available characteristics."
-        ))?;
-    trainer_device.subscribe(&bike_data_char).await?;
-    println!(
-        "Subscribed to Trainer notifications for characteristic {}",
-        bike_data_char.uuid
-    );
-    let mut notif_stream = trainer_device.notifications().await?;
-    while let Some(data) = notif_stream.next().await {
-        // Print raw data for debugging.
-        println!("Raw trainer data: {:?}", data.value);
-        if data.value.len() >= 3 {
-            let power = u16::from_le_bytes([data.value[0], data.value[1]]) as u32;
-            let cadence = data.value[2] as u32;
-            let mut s = state.lock().unwrap();
-            s.current_power = power;
-            s.cadence = cadence;
+    let available_chars: Vec<String> = characteristics.iter().map(|c| c.uuid.to_string()).collect();
+    let bike_data_char = characteristics.iter().find(|c| c.uuid == bike_uuid);
+
+    if let Some(charac) = bike_data_char {
+        trainer_device.subscribe(charac).await?;
+        let mut notif_stream = trainer_device.notifications().await?;
+        while let Some(data) = notif_stream.next().await {
+            let raw = data
+                .value
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            {
+                let mut s = state.lock().await;
+                s.trainer_raw_data = raw.clone();
+
+                if data.value.len() >= 8 {
+                    // FTMS Indoor Bike Data format:
+                    // Bytes 0-1: Flags, 2-3: Instantaneous Speed, 4-5: Instantaneous Cadence, 6-7: Instantaneous Power.
+                    let _flags = u16::from_le_bytes([data.value[0], data.value[1]]);
+                    // let speed = u16::from_le_bytes([data.value[2], data.value[3]]) as f32 / 100.0;
+                    let cadence = u16::from_le_bytes([data.value[4], data.value[5]]) as u32 / 2;
+                    let power = i16::from_le_bytes([data.value[6], data.value[7]]) as i32;
+                    s.current_power = power.abs() as u32; // use abs() in case power is signed.
+                    s.cadence = cadence;
+                }
+            }
         }
+    } else {
+        let err_msg = format!(
+            "Indoor Bike Data characteristic not found. Available: {:?}",
+            available_chars
+        );
+        {
+            let mut s = state.lock().await;
+            s.trainer_raw_data = err_msg.clone();
+        }
+        return Err(anyhow::anyhow!(err_msg));
     }
+    Ok(())
+}
+
+async fn set_trainer_target_power(trainer_device: &Peripheral, power: u16) -> Result<()> {
+    let control_point_uuid = Uuid::parse_str("00002AD9-0000-1000-8000-00805F9B34FB")?;
+
+    let characteristics = trainer_device.characteristics();
+    let characteristic = characteristics
+        .iter()
+        .find(|c| c.uuid == control_point_uuid)
+        .ok_or(anyhow::anyhow!(
+            "FTMS Control Point characteristic not found"
+        ))?;
+
+    let power_bytes = power.to_le_bytes();
+    let command = vec![0x05, power_bytes[0], power_bytes[1]];
+
+    trainer_device
+        .write(
+            characteristic,
+            &command,
+            btleplug::api::WriteType::WithResponse,
+        )
+        .await?;
+
+    println!("Sent power command: {} W", power);
     Ok(())
 }
 
@@ -198,22 +239,34 @@ async fn run_trainer_notifications(
 // CONTROL LOOP & CSV LOGGING
 // =====================
 
-/// Adjusts target power based on heart rate error using a simple proportional controller.
-async fn control_loop(state: Arc<Mutex<SharedState>>) {
-    let mut interval = time::interval(Duration::from_secs(1));
-    let k: f32 = 1.0; // Proportional gain
+/// Adjusts target power based on HR error using a simple proportional controller.
+/// Updates both the "ideal" power (target_power) and simulates sending it by updating last_sent_power.
+async fn control_loop(trainer_device: Peripheral, state: Arc<Mutex<SharedState>>) {
+    let mut interval = time::interval(Duration::from_secs(2));
+    let k: f32 = 1.0;
+
     loop {
         interval.tick().await;
-        let mut data = state.lock().unwrap();
-        let error = data.target_hr as i32 - data.current_hr as i32;
-        let adjustment = (k * error as f32).round() as i32;
-        let new_power = data.target_power as i32 + adjustment;
-        data.target_power = new_power.clamp(0, 400) as u32;
-        // (In production, write the new target power to the trainer via BLE.)
+        {
+            let mut data = state.lock().await;
+            let error = data.target_hr as i32 - data.current_hr as i32;
+            let adjustment = (k * error as f32).round() as i32;
+            let new_power = (data.target_power as i32 + adjustment).clamp(0, 400) as u32;
+            data.target_power = new_power;
+            data.last_sent_power = new_power;
+        }
+        if let Err(e) = set_trainer_target_power(&trainer_device, {
+            let data = state.lock().await;
+            data.target_power as u16
+        })
+        .await
+        {
+            eprintln!("Failed to send power command: {:?}", e);
+        }
     }
 }
 
-/// Logs workout data to a CSV file every second.
+/// Logs workout data to CSV every second.
 async fn csv_logging_task(state: Arc<Mutex<SharedState>>) -> Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -227,7 +280,7 @@ async fn csv_logging_task(state: Arc<Mutex<SharedState>>) -> Result<()> {
     let mut interval = time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let data = state.lock().unwrap();
+        let data = state.lock().await;
         let elapsed_sec = data.start_time.elapsed().as_secs();
         let record = LogRecord {
             timestamp: Local::now().to_rfc3339(),
@@ -252,13 +305,17 @@ fn draw_live_dashboard<B: tui::backend::Backend>(
 ) -> Result<()> {
     terminal.draw(|f| {
         let size = f.size();
-        let block = Block::default()
-            .borders(tui::widgets::Borders::ALL)
-            .title("Live Data");
-        f.render_widget(block, size);
+        // Split the screen horizontally: 60% for metrics, 40% for raw trainer data.
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
+            .split(size);
 
+        let left_block = Block::default()
+            .borders(tui::widgets::Borders::ALL)
+            .title("Metrics");
         let elapsed = state.start_time.elapsed().as_secs();
-        let text = vec![
+        let left_text = vec![
             Spans::from(Span::raw(format!("Elapsed Time: {} sec", elapsed))),
             Spans::from(Span::raw(format!("Current HR: {} bpm", state.current_hr))),
             Spans::from(Span::raw(format!(
@@ -267,12 +324,24 @@ fn draw_live_dashboard<B: tui::backend::Backend>(
             ))),
             Spans::from(Span::raw(format!("Cadence: {} rpm", state.cadence))),
             Spans::from(Span::raw(format!("Target HR: {} bpm", state.target_hr))),
-            Spans::from(Span::raw(format!("Target Power: {} W", state.target_power))),
+            Spans::from(Span::raw(format!("Ideal Power: {} W", state.target_power))),
+            Spans::from(Span::raw(format!(
+                "Last Sent Power: {} W",
+                state.last_sent_power
+            ))),
+        ];
+        let left_paragraph = tui::widgets::Paragraph::new(left_text).block(left_block);
+        f.render_widget(left_paragraph, chunks[0]);
+
+        let right_block = Block::default()
+            .borders(tui::widgets::Borders::ALL)
+            .title("Trainer Raw Data");
+        let right_text = vec![
+            Spans::from(Span::raw(state.trainer_raw_data.clone())),
             Spans::from(Span::raw("Press 'q' to quit.")),
         ];
-        let paragraph = tui::widgets::Paragraph::new(text)
-            .block(Block::default().borders(tui::widgets::Borders::ALL));
-        f.render_widget(paragraph, size);
+        let right_paragraph = tui::widgets::Paragraph::new(right_text).block(right_block);
+        f.render_widget(right_paragraph, chunks[1]);
     })?;
     Ok(())
 }
@@ -285,7 +354,7 @@ async fn live_data_tui(state: Arc<Mutex<SharedState>>) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     loop {
         {
-            let data = state.lock().unwrap();
+            let data = state.lock().await;
             draw_live_dashboard(&mut terminal, &data)?;
         }
         if event::poll(Duration::from_millis(200))? {
@@ -325,7 +394,6 @@ fn draw_device_selection<B: tui::backend::Backend>(
             )
             .split(size);
 
-        // Header: show which device is being selected.
         let title = match app.stage {
             SelectionStage::Hr => "Select Heart Rate Device",
             SelectionStage::Trainer => "Select Trainer Device",
@@ -337,18 +405,14 @@ fn draw_device_selection<B: tui::backend::Backend>(
         );
         f.render_widget(header, chunks[0]);
 
-        // Prepare table rows.
-        // Only include devices with a known name (i.e. not "Unknown").
         let rows: Vec<Row> = app
             .devices
             .iter()
-            .filter(|(_, name, _, _)| name.to_lowercase() != "unknown")
-            .map(|(_stable_id, name, rssi, _)| {
+            .map(|(_id, name, rssi, _)| {
                 let (bar, color) = rssi_bar(*rssi);
                 Row::new(vec![
                     Cell::from(name.to_string()),
                     Cell::from(rssi.to_string()),
-                    // Render the bar with the chosen color.
                     Cell::from(Span::styled(bar, Style::default().fg(color))),
                 ])
             })
@@ -368,7 +432,6 @@ fn draw_device_selection<B: tui::backend::Backend>(
                 Constraint::Length(15),
             ]);
 
-        // Create a mutable TableState and set selection.
         let mut table_state = tui::widgets::TableState::default();
         table_state.select(Some(app.selected_index));
         f.render_stateful_widget(table, chunks[1], &mut table_state);
@@ -383,7 +446,6 @@ fn draw_device_selection<B: tui::backend::Backend>(
 }
 
 async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
-    // Prepare BLE adapter and start scanning.
     let manager = Manager::new().await?;
     let adapters = manager.adapters().await?;
     let adapter = adapters
@@ -402,9 +464,7 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
     let start_scan = Instant::now();
     let mut selection_complete = false;
 
-    // Main event loop for device selection.
     while !selection_complete {
-        // Update the device list using stable IDs.
         let peripherals = adapter.peripherals().await?;
         let mut new_devices = Vec::new();
         for p in peripherals {
@@ -414,11 +474,9 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
                 .and_then(|p| p.local_name.clone())
                 .unwrap_or_else(|| "Unknown".into());
             let rssi = props.as_ref().and_then(|p| p.rssi).unwrap_or(i16::MIN);
-            // Skip devices with name "Unknown".
             if name.to_lowercase() == "unknown" {
                 continue;
             }
-            // Check if this peripheral already exists in app.devices.
             let p_id_str = format!("{:?}", p.id());
             let existing = app
                 .devices
@@ -433,13 +491,11 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
             };
             new_devices.push((stable_id, name, rssi, p));
         }
-        // Sort devices alphabetically by name.
         new_devices.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
         app.devices = new_devices;
 
         draw_device_selection(&mut terminal, &app)?;
 
-        // Process key events.
         if event::poll(Duration::from_millis(500))? {
             if let CEvent::Key(key) = event::read()? {
                 match key.code {
@@ -454,7 +510,7 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
                         }
                     }
                     KeyCode::Enter => {
-                        if let Some(&(ref _stable_id, ref _name, ref _rssi, ref peripheral)) =
+                        if let Some((_id, _name, _rssi, peripheral)) =
                             app.devices.get(app.selected_index)
                         {
                             match app.stage {
@@ -480,7 +536,6 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
                 }
             }
         }
-        // Optionally break after 10 seconds if no devices found.
         if start_scan.elapsed() > Duration::from_secs(10) && app.devices.is_empty() {
             break;
         }
@@ -513,7 +568,6 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Run the device selection TUI.
     let (hr_device, trainer_device) = device_selection_tui().await?;
     println!("Devices selected.");
 
@@ -525,7 +579,9 @@ async fn main() -> Result<()> {
             eprintln!("HR notifications error: {:?}", e);
         }
     });
+
     let trainer_state = shared_state.clone();
+    let trainer_for_control = trainer_device.clone();
     let trainer_task = tokio::spawn(async move {
         if let Err(e) = run_trainer_notifications(trainer_device, trainer_state).await {
             eprintln!("Trainer notifications error: {:?}", e);
@@ -534,13 +590,7 @@ async fn main() -> Result<()> {
 
     let control_state = shared_state.clone();
     tokio::spawn(async move {
-        control_loop(control_state).await;
-    });
-    let log_state = shared_state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = csv_logging_task(log_state).await {
-            eprintln!("CSV logging error: {:?}", e);
-        }
+        control_loop(trainer_for_control, control_state).await;
     });
 
     live_data_tui(shared_state).await?;
