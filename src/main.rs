@@ -9,7 +9,7 @@ use crossterm::{
 };
 use futures::stream::StreamExt;
 use serde::Serialize;
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::io::{Stdout, Write, stdout};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,7 +18,7 @@ use tui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Span, Spans},
     widgets::{Block, Borders, Cell, Row, Table},
 };
@@ -44,7 +44,7 @@ impl SharedState {
             current_hr: 0,
             current_power: 0,
             cadence: 0,
-            target_hr: 140, // Default target HR; could be updated later.
+            target_hr: 140, // Default target HR.
             target_power: 0,
             start_time: Instant::now(),
         }
@@ -72,15 +72,17 @@ enum SelectionStage {
 }
 
 struct App {
-    // List of discovered devices (index, name, RSSI, peripheral)
-    devices: Vec<(usize, String, i16, Peripheral)>,
-    // Currently highlighted index (in the sorted list)
+    // Vector of devices with a stable local id, name, RSSI, and Peripheral.
+    devices: Vec<(u32, String, i16, Peripheral)>,
+    // Currently highlighted index in the list.
     selected_index: usize,
     // Which device are we selecting: HR or Trainer?
     stage: SelectionStage,
     // Once selected, store the chosen peripherals.
     hr_device: Option<Peripheral>,
     trainer_device: Option<Peripheral>,
+    // Next stable id to assign.
+    next_id: u32,
 }
 
 impl App {
@@ -91,8 +93,34 @@ impl App {
             stage: SelectionStage::Hr,
             hr_device: None,
             trainer_device: None,
+            next_id: 0,
         }
     }
+}
+
+// =====================
+// HELPER FUNCTION: RSSI BAR
+// =====================
+
+/// Computes a signal strength bar (10-character wide) and chooses a color based on the RSSI.
+/// Assumes excellent RSSI = -40, poor RSSI = -100.
+fn rssi_bar(rssi: i16) -> (String, Color) {
+    let max_rssi = -40;
+    let min_rssi = -100;
+    let bar_length = 10;
+    let ratio = ((rssi - min_rssi) as f32 / (max_rssi - min_rssi) as f32).clamp(0.0, 1.0);
+    let fill_count = (ratio * bar_length as f32).round() as usize;
+    let filled = "█".repeat(fill_count);
+    let empty = " ".repeat(bar_length - fill_count);
+    let bar = format!("{}{}", filled, empty);
+    let color = if ratio >= 0.66 {
+        Color::Green
+    } else if ratio >= 0.33 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+    (bar, color)
 }
 
 // =====================
@@ -128,22 +156,33 @@ async fn run_hr_notifications(hr_device: Peripheral, state: Arc<Mutex<SharedStat
     Ok(())
 }
 
-/// Subscribes to Trainer notifications using the Indoor Bike Data UUID.
+/// Subscribes to Trainer notifications. If the Indoor Bike Data characteristic (UUID 0x2A5B)
+/// isn’t found, prints available characteristic UUIDs and logs raw data.
 async fn run_trainer_notifications(
     trainer_device: Peripheral,
     state: Arc<Mutex<SharedState>>,
 ) -> Result<()> {
     let bike_uuid = Uuid::parse_str("00002A5B-0000-1000-8000-00805F9B34FB")?;
-    let bike_data_char = trainer_device
-        .characteristics()
+    let characteristics = trainer_device.characteristics();
+    println!("Trainer device characteristics:");
+    for c in &characteristics {
+        println!("  UUID: {}", c.uuid);
+    }
+    let bike_data_char = characteristics
         .into_iter()
         .find(|c| c.uuid == bike_uuid)
-        .ok_or(anyhow::anyhow!("Indoor Bike Data characteristic not found"))?;
+        .ok_or(anyhow::anyhow!(
+            "Indoor Bike Data characteristic not found. See above for available characteristics."
+        ))?;
     trainer_device.subscribe(&bike_data_char).await?;
-    println!("Subscribed to Trainer notifications.");
-
+    println!(
+        "Subscribed to Trainer notifications for characteristic {}",
+        bike_data_char.uuid
+    );
     let mut notif_stream = trainer_device.notifications().await?;
     while let Some(data) = notif_stream.next().await {
+        // Print raw data for debugging.
+        println!("Raw trainer data: {:?}", data.value);
         if data.value.len() >= 3 {
             let power = u16::from_le_bytes([data.value[0], data.value[1]]) as u32;
             let cadence = data.value[2] as u32;
@@ -156,10 +195,10 @@ async fn run_trainer_notifications(
 }
 
 // =====================
-// CONTROL LOOP & CSV LOGGING (unchanged)
+// CONTROL LOOP & CSV LOGGING
 // =====================
 
-/// Adjusts target power based on the heart rate error using a simple proportional controller.
+/// Adjusts target power based on heart rate error using a simple proportional controller.
 async fn control_loop(state: Arc<Mutex<SharedState>>) {
     let mut interval = time::interval(Duration::from_secs(1));
     let k: f32 = 1.0; // Proportional gain
@@ -170,7 +209,7 @@ async fn control_loop(state: Arc<Mutex<SharedState>>) {
         let adjustment = (k * error as f32).round() as i32;
         let new_power = data.target_power as i32 + adjustment;
         data.target_power = new_power.clamp(0, 400) as u32;
-        // In a full implementation, write the new target power to the trainer via BLE.
+        // (In production, write the new target power to the trainer via BLE.)
     }
 }
 
@@ -213,7 +252,9 @@ fn draw_live_dashboard<B: tui::backend::Backend>(
 ) -> Result<()> {
     terminal.draw(|f| {
         let size = f.size();
-        let block = Block::default().borders(Borders::ALL).title("Live Data");
+        let block = Block::default()
+            .borders(tui::widgets::Borders::ALL)
+            .title("Live Data");
         f.render_widget(block, size);
 
         let elapsed = state.start_time.elapsed().as_secs();
@@ -227,13 +268,10 @@ fn draw_live_dashboard<B: tui::backend::Backend>(
             Spans::from(Span::raw(format!("Cadence: {} rpm", state.cadence))),
             Spans::from(Span::raw(format!("Target HR: {} bpm", state.target_hr))),
             Spans::from(Span::raw(format!("Target Power: {} W", state.target_power))),
-            Spans::from(Span::styled(
-                "Press 'q' to quit.",
-                Style::default().fg(Color::Yellow),
-            )),
+            Spans::from(Span::raw("Press 'q' to quit.")),
         ];
-        let paragraph =
-            tui::widgets::Paragraph::new(text).block(Block::default().borders(Borders::ALL));
+        let paragraph = tui::widgets::Paragraph::new(text)
+            .block(Block::default().borders(tui::widgets::Borders::ALL));
         f.render_widget(paragraph, size);
     })?;
     Ok(())
@@ -250,7 +288,6 @@ async fn live_data_tui(state: Arc<Mutex<SharedState>>) -> Result<()> {
             let data = state.lock().unwrap();
             draw_live_dashboard(&mut terminal, &data)?;
         }
-        // Poll for key events with a 200ms timeout.
         if event::poll(Duration::from_millis(200))? {
             if let CEvent::Key(KeyEvent { code, .. }) = event::read()? {
                 if code == KeyCode::Char('q') {
@@ -288,55 +325,58 @@ fn draw_device_selection<B: tui::backend::Backend>(
             )
             .split(size);
 
-        // Title and instructions.
+        // Header: show which device is being selected.
         let title = match app.stage {
             SelectionStage::Hr => "Select Heart Rate Device",
             SelectionStage::Trainer => "Select Trainer Device",
         };
         let header = tui::widgets::Paragraph::new(title).block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(tui::widgets::Borders::ALL)
                 .title("Device Selection"),
         );
         f.render_widget(header, chunks[0]);
 
-        // Prepare table rows from app.devices.
+        // Prepare table rows.
+        // Only include devices with a known name (i.e. not "Unknown").
         let rows: Vec<Row> = app
             .devices
             .iter()
-            .map(|(i, name, rssi, _)| {
+            .filter(|(_, name, _, _)| name.to_lowercase() != "unknown")
+            .map(|(_stable_id, name, rssi, _)| {
+                let (bar, color) = rssi_bar(*rssi);
                 Row::new(vec![
-                    Cell::from(i.to_string()),
                     Cell::from(name.to_string()),
                     Cell::from(rssi.to_string()),
+                    // Render the bar with the chosen color.
+                    Cell::from(Span::styled(bar, Style::default().fg(color))),
                 ])
             })
             .collect();
 
         let table = Table::new(rows)
-            .header(Row::new(vec![
-                Cell::from("Index"),
-                Cell::from("Name"),
-                Cell::from("RSSI"),
-            ]))
+            .header(Row::new(vec!["Name", "RSSI", "Signal"]))
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(tui::widgets::Borders::ALL)
                     .title("Discovered Devices"),
             )
             .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
             .widths(&[
-                Constraint::Length(6),
                 Constraint::Percentage(50),
                 Constraint::Length(10),
+                Constraint::Length(15),
             ]);
+
+        // Create a mutable TableState and set selection.
         let mut table_state = tui::widgets::TableState::default();
         table_state.select(Some(app.selected_index));
         f.render_stateful_widget(table, chunks[1], &mut table_state);
 
-        let footer =
-            tui::widgets::Paragraph::new("Use Up/Down arrows to navigate, Enter to select.")
-                .block(Block::default().borders(Borders::ALL));
+        let footer = tui::widgets::Paragraph::new(
+            "Use Up/Down arrows to navigate, Enter to select. (Press 'q' to quit)",
+        )
+        .block(Block::default().borders(tui::widgets::Borders::ALL));
         f.render_widget(footer, chunks[2]);
     })?;
     Ok(())
@@ -359,33 +399,48 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
-    // We'll scan for 10 seconds (or until the user confirms both selections).
     let start_scan = Instant::now();
     let mut selection_complete = false;
 
     // Main event loop for device selection.
     while !selection_complete {
-        // Update the device list.
+        // Update the device list using stable IDs.
         let peripherals = adapter.peripherals().await?;
-        let mut devices: Vec<(usize, String, i16, Peripheral)> = Vec::new();
-        for (i, p) in peripherals.iter().enumerate() {
+        let mut new_devices = Vec::new();
+        for p in peripherals {
             let props = p.properties().await?;
             let name = props
                 .as_ref()
                 .and_then(|p| p.local_name.clone())
                 .unwrap_or_else(|| "Unknown".into());
             let rssi = props.as_ref().and_then(|p| p.rssi).unwrap_or(i16::MIN);
-            devices.push((i, name, rssi, p.clone()));
+            // Skip devices with name "Unknown".
+            if name.to_lowercase() == "unknown" {
+                continue;
+            }
+            // Check if this peripheral already exists in app.devices.
+            let p_id_str = format!("{:?}", p.id());
+            let existing = app
+                .devices
+                .iter()
+                .find(|(_, _, _, existing)| format!("{:?}", existing.id()) == p_id_str);
+            let stable_id = if let Some(&(id, _, _, _)) = existing {
+                id
+            } else {
+                let id = app.next_id;
+                app.next_id += 1;
+                id
+            };
+            new_devices.push((stable_id, name, rssi, p));
         }
-        // Order devices by RSSI descending.
-        devices.sort_by_key(|&(_, _, rssi, _)| Reverse(rssi));
-        app.devices = devices;
+        // Sort devices alphabetically by name.
+        new_devices.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        app.devices = new_devices;
 
-        // Draw the device selection screen.
         draw_device_selection(&mut terminal, &app)?;
 
-        // Wait up to 200ms for an input event.
-        if event::poll(Duration::from_millis(200))? {
+        // Process key events.
+        if event::poll(Duration::from_millis(500))? {
             if let CEvent::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Up => {
@@ -399,14 +454,12 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
                         }
                     }
                     KeyCode::Enter => {
-                        // On Enter, record selection based on stage.
-                        if let Some((_, _name, _rssi, peripheral)) =
+                        if let Some(&(ref _stable_id, ref _name, ref _rssi, ref peripheral)) =
                             app.devices.get(app.selected_index)
                         {
                             match app.stage {
                                 SelectionStage::Hr => {
                                     app.hr_device = Some(peripheral.clone());
-                                    // Reset index and move to next stage.
                                     app.selected_index = 0;
                                     app.stage = SelectionStage::Trainer;
                                 }
@@ -418,7 +471,6 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
                         }
                     }
                     KeyCode::Char('q') => {
-                        // Allow quitting during selection.
                         disable_raw_mode()?;
                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                         terminal.show_cursor()?;
@@ -428,17 +480,15 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
                 }
             }
         }
-        // Optionally, break after 10 seconds if no selection is made.
+        // Optionally break after 10 seconds if no devices found.
         if start_scan.elapsed() > Duration::from_secs(10) && app.devices.is_empty() {
             break;
         }
     }
-    // Restore terminal.
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    // Make sure both devices were selected.
     let hr_device = app
         .hr_device
         .ok_or(anyhow::anyhow!("No Heart Rate device selected"))?;
@@ -446,7 +496,6 @@ async fn device_selection_tui() -> Result<(Peripheral, Peripheral)> {
         .trainer_device
         .ok_or(anyhow::anyhow!("No Trainer device selected"))?;
 
-    // Connect and discover services.
     if !hr_device.is_connected().await? {
         hr_device.connect().await?;
     }
@@ -468,10 +517,8 @@ async fn main() -> Result<()> {
     let (hr_device, trainer_device) = device_selection_tui().await?;
     println!("Devices selected.");
 
-    // Initialize shared state.
     let shared_state = Arc::new(Mutex::new(SharedState::new()));
 
-    // Spawn BLE notification tasks.
     let hr_state = shared_state.clone();
     let hr_task = tokio::spawn(async move {
         if let Err(e) = run_hr_notifications(hr_device, hr_state).await {
@@ -485,7 +532,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn control loop and CSV logging tasks.
     let control_state = shared_state.clone();
     tokio::spawn(async move {
         control_loop(control_state).await;
@@ -497,7 +543,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Run the live data dashboard.
     live_data_tui(shared_state).await?;
 
     let _ = tokio::join!(hr_task, trainer_task);
